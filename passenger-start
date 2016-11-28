@@ -1,0 +1,129 @@
+#!/bin/bash
+
+set -eu
+
+start_args=(start)
+restart_args=(restart-app)
+stop_args=(stop)
+monitor_command=(passenger-monitor)
+delay_on_graceful_stop=
+timestamp=0
+
+function parse_arguments() {
+  while (($# > 0)); do
+    case "$1" in
+      --delay-on-graceful-stop)
+        delay_on_graceful_stop="$2"
+        shift
+        ;;
+      # for passenger-monitor with a value
+      --memory-limit|--max-requests)
+        monitor_command+=("$1" "$2")
+        shift
+        ;;
+      --timestamp)
+        timestamp=1
+        monitor_command+=("$1")
+        ;;
+      # for start and stop with "="
+      --port=*|--pid-file=*)
+        start_args+=("$1")
+        stop_args+=("$1")
+        ;;
+      # for start and stop without "="
+      -p|--port|--pid-file)
+        start_args+=("$1" "$2")
+        stop_args+=("$1" "$2")
+        shift
+        ;;
+      # for start with "="
+      -*=*)
+        start_args+=("$1")
+        ;;
+      # for start without "="
+      -*)
+        start_args+=("$1" "$2")
+        shift
+        ;;
+      # app directory
+      *)
+        start_args+=("$1")
+        stop_args+=("$1")
+        restart_args+=("$1")
+        ;;
+    esac
+    shift
+  done
+
+  if ((${#restart_args[@]} == 1)); then
+    restart_args+=(.)
+  fi
+}
+
+function restart() {
+  run passenger-config "${restart_args[@]}"
+}
+
+function reopen() {
+  run passenger-config reopen-logs
+}
+
+function stop() {
+  run passenger "${stop_args[@]}"
+}
+
+function graceful_stop() {
+  if [[ -n "$delay_on_graceful_stop" ]]; then
+    log "graceful-stop: waiting delay $delay_on_graceful_stop"
+    sleep "$delay_on_graceful_stop"
+  fi
+
+  while :; do
+    local status sessions
+    status="$(passenger-status)"
+    sessions=$(echo "$status" | awk '/ Sessions: / { sum += $5 } END { print sum }')
+
+    if ((sessions == 0)); then
+      run passenger "${stop_args[@]}"
+      break
+    else
+      log "graceful-stop: waiting for $sessions sessions to finish"
+    fi
+
+    sleep 1
+  done
+}
+
+function passenger_monitor() {
+  if ! type "${monitor_command[0]}" >/dev/null; then return; fi
+
+  while :; do
+    sleep 1m
+    "${monitor_command[@]}" &
+  done
+}
+
+function run() {
+  log "+ $*"
+  "$@"
+}
+
+function log() {
+  local message="$*"
+  if ((timestamp)); then message="$(date -Is) $message"; fi
+  echo "$message"
+}
+
+parse_arguments "$@"
+
+trap 'restart;                                wait'       HUP
+trap 'reopen;                                 wait'       USR1
+trap 'stop;          jobs -p | xargs -r kill; wait; exit' INT TERM
+trap 'graceful_stop; jobs -p | xargs -r kill; wait; exit' QUIT
+
+log "+ passenger ${start_args[*]}"
+passenger "${start_args[@]}" &
+
+passenger_monitor &
+
+wait

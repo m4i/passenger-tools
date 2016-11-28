@@ -1,0 +1,160 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# required ruby version: >= 1.8.7
+
+# compatibility with ruby 2.3 or earlier
+module Enumerable
+  def sum(identity = 0, &block)
+    if block_given?
+      map(&block).sum(identity)
+    else
+      inject { |sum, element| sum + element } || identity
+    end
+  end unless method_defined?(:sum)
+end
+
+# compatibility with ruby 1.8.7
+Float::INFINITY = 1.0 / 0 unless Float.const_defined?(:INFINITY)
+
+# compatibility with ruby 1.8.7
+require 'rubygems' unless defined?(Gem)
+
+require 'json'
+require 'optparse'
+require 'rexml/document'
+
+class PassengerStatus
+  class << self
+    def run
+      # suppress the following message
+      # "*** Tip: if you install the 'xmllint' command then the XML output will be indented."
+      xml = `passenger-status --show xml 2>/dev/null`
+      new(xml)
+    end
+  end
+
+  def initialize(xml)
+    @doc = REXML::Document.new(xml)
+  end
+
+  def max
+    @_max ||= REXML::XPath.first(@doc, '/info/max').text.to_i
+  end
+
+  def process_count
+    @_process_count ||= REXML::XPath.first(@doc, '/info/process_count').text.to_i
+  end
+
+  def session_count
+    @_session_count ||= processes.sum(&:sessions)
+  end
+
+  def queue_size
+    [session_count + total_get_wait_list_size - max, 0].max
+  end
+
+  def processes
+    @_processes ||= REXML::XPath.
+      match(@doc, '/info/supergroups/supergroup/group/processes/process').
+      map { |element| Process.new(element) }
+  end
+
+  def as_json
+    {
+      :max           => max,
+      :process_count => process_count,
+      :sessions      => session_count,
+      :queue_size    => queue_size,
+      :processes     => processes.map(&:as_json),
+    }
+  end
+
+  def detach(options)
+    processes.each { |process| process.detach(options) }
+  end
+
+  private
+
+  def total_get_wait_list_size
+    @_total_get_wait_list_size ||= REXML::XPath.
+      match(@doc, '//get_wait_list_size').
+      sum { |element| element.text.to_i }
+  end
+
+  class Process
+    def initialize(element)
+      @element = element
+    end
+
+    def pid
+      @_pid ||= REXML::XPath.first(@element, 'pid').text.to_i
+    end
+
+    def sessions
+      @_sessions ||= REXML::XPath.first(@element, 'sessions').text.to_i
+    end
+
+    def processed
+      @_processed ||= REXML::XPath.first(@element, 'processed').text.to_i
+    end
+
+    def cpu
+      # compatibility with ruby 2.2 or earlier
+      #@_cpu ||= REXML::XPath.first(@element, 'cpu')&.text.to_i
+      @_cpu ||= (e = REXML::XPath.first(@element, 'cpu')) ? e.text.to_i : 0
+    end
+
+    def memory
+      # compatibility with ruby 2.2 or earlier
+      #@_memory ||= REXML::XPath.first(@element, 'real_memory')&.text.to_i / 1024
+      @_memory ||= (e = REXML::XPath.first(@element, 'real_memory')) ? e.text.to_i / 1024 : 0
+    end
+
+    def as_json
+      {
+        :pid       => pid,
+        :sessions  => sessions,
+        :processed => processed,
+        :cpu       => cpu,
+        :memory    => memory,
+      }
+    end
+
+    # compatibility with ruby 1.9 or earlier
+    #def detach(memory_limit: Float::INFINITY, max_requests: Float::INFINITY)
+    def detach(options)
+      memory_limit = options[:memory_limit] || Float::INFINITY
+      max_requests = options[:max_requests] || Float::INFINITY
+
+      return if memory <= memory_limit && processed <= max_requests
+
+      log({ :type => 'passenger-detach' }.merge(as_json).to_json)
+      run(*%W(passenger-config detach-process #{pid}))
+    end
+  end
+end
+
+def run(*command)
+  log '+ ' + command.join(' ')
+  system(*command)
+end
+
+def log(message)
+  if $timestamp
+    message = Time.now.strftime('%FT%T%z ') + message
+  end
+  puts message
+end
+
+options = {}
+$timestamp = false
+opt = OptionParser.new
+opt.on('--memory-limit MB')    { |v| options[:memoly_limit] = v.to_i }
+opt.on('--max-requests COUNT') { |v| options[:max_requests] = v.to_i }
+opt.on('--timestamp')          { $timestamp = true }
+opt.parse!(ARGV)
+
+status = PassengerStatus.run
+log({ :type => 'passenger-status' }.merge(status.as_json).to_json)
+status.detach(options)

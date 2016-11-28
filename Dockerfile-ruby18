@@ -1,0 +1,35 @@
+FROM m4i0/ruby:1.8.7-slim
+
+# install passenger
+RUN \
+	# passenger: g++ make
+	# passenger-config install-standalone-runtime: wget
+	buildDeps=' \
+		g++ \
+		make \
+		wget \
+	' \
+	\
+	# apt
+	&& apt-get update \
+	&& apt-get install -y --no-install-recommends $buildDeps \
+	&& rm -r /var/lib/apt/lists/* \
+	\
+	# ruby
+	&& gem install rack --version 1.6.5 \
+	&& gem install rake --version 10.5.0 \
+	&& gem install passenger \
+	&& passenger-config install-standalone-runtime \
+	&& passenger-config build-native-support \
+	&& gem install json --version 1.8.3 \
+	\
+	# cleanup
+	&& apt-get purge -y --auto-remove $buildDeps
+
+WORKDIR /app
+
+EXPOSE 3000
+CMD ["passenger-start", "--delay-on-graceful-stop", "5s", "--memory-limit", "500", "--max-requests", "1000", "--timestamp"]
+
+COPY test /app
+COPY passenger-start passenger-monitor /usr/local/bin/
